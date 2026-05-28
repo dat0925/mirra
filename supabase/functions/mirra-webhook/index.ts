@@ -57,20 +57,34 @@ async function handleMessage(event: LineEvent, supabase: any) {
       salon_id: salon.id, customer_id: customer.id, role: "user", content: userMessage,
     });
 
+    // 直近の予約を取得
     const { data: upcomingAppointments } = await supabase
       .from("appointments").select("*")
       .eq("customer_id", customer.id).in("status", ["pending", "confirmed"])
       .gte("scheduled_at", new Date().toISOString())
       .order("scheduled_at", { ascending: true }).limit(3);
 
+    // 直近のカルテを取得（最新3件）
+    const { data: recentKarte } = await supabase
+      .from("karte").select("*")
+      .eq("customer_id", customer.id)
+      .order("visited_at", { ascending: false }).limit(3);
+
     const reply = await callClaude({
       salon, customer, userMessage,
       conversationHistory,
       upcomingAppointments: upcomingAppointments ?? [],
+      recentKarte: recentKarte ?? [],
     });
 
+    // 予約確定の検知
     if (reply.includes("承りました")) {
       await saveAppointment(reply, conversationHistory, userMessage, customer, salon, supabase);
+    }
+
+    // カルテ登録の検知（「カルテ登録しました」をClaudeが返した場合）
+    if (reply.includes("カルテを登録しました")) {
+      await saveKarte(reply, conversationHistory, userMessage, customer, salon, supabase);
     }
 
     await supabase.from("conversations").insert({
@@ -85,6 +99,100 @@ async function handleMessage(event: LineEvent, supabase: any) {
   }
 }
 
+// ─────────────────────────────────────────
+// カルテ保存
+// ─────────────────────────────────────────
+async function saveKarte(
+  reply: string,
+  history: { role: string; content: string }[],
+  lastMessage: string,
+  customer: any,
+  salon: any,
+  supabase: any
+) {
+  try {
+    const conversationText = [
+      ...history.map(h => `${h.role === "user" ? "担当者" : "MIRRA"}: ${h.content}`),
+      `担当者: ${lastMessage}`,
+      `MIRRA: ${reply}`,
+    ].join("\n");
+
+    const extractRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": Deno.env.get("ANTHROPIC_API_KEY") ?? "",
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 300,
+        system: `以下の会話からカルテ情報を抽出し、JSONのみ返してください。余分なテキスト不要。
+{
+  "visited_at": "YYYY-MM-DD（来店日、不明なら今日）",
+  "treatment": "施術内容",
+  "color_recipe": "カラーレシピまたはnull",
+  "condition": "髪の状態またはnull",
+  "notes": "担当者メモまたはnull",
+  "next_suggestion": "次回提案またはnull",
+  "staff_name": "担当スタッフ名またはnull"
+}
+今日: ${new Date().toLocaleDateString("ja-JP", { timeZone: "Asia/Tokyo" })}`,
+        messages: [{ role: "user", content: conversationText }],
+      }),
+    });
+
+    if (!extractRes.ok) return;
+    const extractData = await extractRes.json();
+    const karteInfo = JSON.parse(extractData.content[0].text.trim());
+    if (!karteInfo.treatment) return;
+
+    // 直近の確定予約をappointment_idとして紐付け
+    const { data: lastAppointment } = await supabase
+      .from("appointments").select("id")
+      .eq("customer_id", customer.id)
+      .eq("status", "confirmed")
+      .order("scheduled_at", { ascending: false }).limit(1).single();
+
+    const { error } = await supabase.from("karte").insert({
+      salon_id: salon.id,
+      customer_id: customer.id,
+      appointment_id: lastAppointment?.id ?? null,
+      visited_at: karteInfo.visited_at,
+      treatment: karteInfo.treatment,
+      color_recipe: karteInfo.color_recipe ?? null,
+      condition: karteInfo.condition ?? null,
+      notes: karteInfo.notes ?? null,
+      next_suggestion: karteInfo.next_suggestion ?? null,
+      staff_name: karteInfo.staff_name ?? null,
+    });
+
+    if (error) {
+      console.error("karte insert error:", error);
+    } else {
+      console.log("Karte saved for customer:", customer.name);
+      // visit_count をインクリメント
+      await supabase.from("customers")
+        .update({
+          visit_count: (customer.visit_count ?? 0) + 1,
+          last_visit_at: new Date().toISOString(),
+        })
+        .eq("id", customer.id);
+      // 予約をdone状態に更新
+      if (lastAppointment?.id) {
+        await supabase.from("appointments")
+          .update({ status: "done" })
+          .eq("id", lastAppointment.id);
+      }
+    }
+  } catch (err) {
+    console.error("saveKarte error:", err);
+  }
+}
+
+// ─────────────────────────────────────────
+// 予約保存（既存）
+// ─────────────────────────────────────────
 async function saveAppointment(
   reply: string,
   history: { role: string; content: string }[],
@@ -144,10 +252,14 @@ async function saveAppointment(
   }
 }
 
-async function callClaude({ salon, customer, userMessage, conversationHistory, upcomingAppointments }: any) {
+// ─────────────────────────────────────────
+// Claude呼び出し（カルテ情報を追加）
+// ─────────────────────────────────────────
+async function callClaude({ salon, customer, userMessage, conversationHistory, upcomingAppointments, recentKarte }: any) {
   const today = new Date().toLocaleDateString("ja-JP", {
     year: "numeric", month: "long", day: "numeric", weekday: "long", timeZone: "Asia/Tokyo",
   });
+
   const appointmentInfo = upcomingAppointments.length > 0
     ? upcomingAppointments.map((a: any) => {
         const date = new Date(a.scheduled_at).toLocaleString("ja-JP", {
@@ -158,17 +270,29 @@ async function callClaude({ salon, customer, userMessage, conversationHistory, u
       }).join("\n")
     : "なし";
 
+  // カルテ情報を文字列化
+  const karteInfo = recentKarte.length > 0
+    ? recentKarte.map((k: any) =>
+        `【${k.visited_at}】${k.treatment ?? ""}${k.color_recipe ? " / レシピ:" + k.color_recipe : ""}${k.next_suggestion ? " / 次回:" + k.next_suggestion : ""}`
+      ).join("\n")
+    : "なし";
+
   const systemPrompt = `${salon.claude_system_prompt ?? "あなたはMIRRA（ミラ）という美容室の予約AIアシスタントです。"}
 
 【サロン名】${salon.name}
 【今日】${today}
 【お客様】${customer.name ?? "未登録"}（来店${customer.visit_count}回）
 【直近の予約】${appointmentInfo}
+【カルテ履歴（最新3件）】
+${karteInfo}
 
 【ルール】
 - 予約受付時は「日付」「時間帯」「メニュー」を必ず確認する
 - 曖昧な日付は具体的な日付を添えて確認する
 - 予約確定時は必ず「✅ ご予約を承りました」と返答に含める
+- カルテ登録依頼（「カルテ登録」「施術記録」など）を受けたら各項目をヒアリングし、確認後「📋 カルテを登録しました」と返答に含める
+- カルテ登録項目：施術内容・カラーレシピ（カラーの場合）・髪の状態・担当者メモ・次回提案
+- 「前回の施術は？」「カルテ見せて」などの質問にはカルテ履歴を参照して答える
 - 返答は短くLINEらしい文体で。絵文字は1〜2個まで`;
 
   const messages = [
